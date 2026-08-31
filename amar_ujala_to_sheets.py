@@ -3,20 +3,20 @@ import json
 import time
 import requests
 import xml.etree.ElementTree as ET
-import google.generativeai as genai
+from groq import Groq
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
 import pytz
 
 # Environment Variables setup
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 SPREADSHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "1zxVYJ0Xj7MzwEQzXST2oUBHDc42NDm4KrncwhaUlfRk")
 CREDENTIALS_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "service-account.json")
 RSS_URL = os.environ.get("RSS_URL", "https://www.amarujala.com/rss/uttarakhand.xml")
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Kolkata")
 
-genai.configure(api_key=GEMINI_API_KEY)
+client_groq = Groq(api_key=GROQ_API_KEY)
 
 def fetch_news_from_rss():
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -39,8 +39,6 @@ def fetch_news_from_rss():
     return articles[:10]
 
 def extract_structured_data(news_item, today_date_str):
-    model = genai.GenerativeModel('gemini-3.6-flash')
-    
     prompt = f"""
     Aapko Uttarakhand News parse karni hai aur Ground Impact Assessment Sheet ke exact format me extract karna hai.
     
@@ -74,9 +72,14 @@ def extract_structured_data(news_item, today_date_str):
     """
     
     try:
-        response = model.generate_content(prompt)
-        clean_json = response.text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(clean_json)
+        response = client_groq.chat.completions.create(
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"}
+        )
+        data = json.loads(response.choices[0].message.content)
         return data
     except Exception as e:
         print(f"Error parsing news item: {e}")
@@ -129,9 +132,7 @@ if __name__ == "__main__":
         parsed = extract_structured_data(item, today_date_str)
         if parsed and parsed.get("is_relevant"):
             relevant_entries.append(parsed)
-        
-        # Rate limit exceed na ho iske liye 10 second ka delay
-        time.sleep(10)
+        time.sleep(1) # Groq lightning fast hai, 1sec ka delay enough hai
             
     append_to_sheet(relevant_entries, today_tab_name)
     print("Task Completed Successfully.")
