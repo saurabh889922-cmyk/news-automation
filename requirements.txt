@@ -1,6 +1,5 @@
-requests
-beautifulsoup4
+groq
 gspread
-google-generativeai
 oauth2client
 pytz
+requests
