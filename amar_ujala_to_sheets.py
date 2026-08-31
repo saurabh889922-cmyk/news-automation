@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 import xml.etree.ElementTree as ET
 import google.generativeai as genai
@@ -35,7 +36,7 @@ def fetch_news_from_rss():
                     "link": link,
                     "description": description
                 })
-    return articles[:5]
+    return articles[:10]
 
 def extract_structured_data(news_item, today_date_str):
     model = genai.GenerativeModel('gemini-3.6-flash')
@@ -128,6 +129,9 @@ if __name__ == "__main__":
         parsed = extract_structured_data(item, today_date_str)
         if parsed and parsed.get("is_relevant"):
             relevant_entries.append(parsed)
+        
+        # Rate limit exceed na ho iske liye 10 second ka delay
+        time.sleep(10)
             
     append_to_sheet(relevant_entries, today_tab_name)
     print("Task Completed Successfully.")
