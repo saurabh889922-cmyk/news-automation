@@ -4,7 +4,8 @@ import time
 import re
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, date
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -21,7 +22,8 @@ SPREADSHEET_ID = os.environ.get(
 CREDENTIALS_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "service-account.json")
 RSS_URL = os.environ.get("RSS_URL", "https://www.amarujala.com/rss/uttarakhand.xml")
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Kolkata")
-MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "30"))
+MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "100"))
+TARGET_NEWS = int(os.environ.get("TARGET_NEWS", "10"))
 MAX_ARTICLE_CHARS = int(os.environ.get("MAX_ARTICLE_CHARS", "18000"))
 
 if not GROQ_API_KEY:
@@ -126,11 +128,24 @@ def normalize_constituency(value):
 
 
 def format_constituency(key):
-    number, name, _ = CONSTITUENCY[key]
-    return f"{name} (संख्या - {number:02d})"
+    # Keep the Sheet visually clean: only the constituency name in column A.
+    return CONSTITUENCY[key][1]
 
 
-def fetch_news_from_rss():
+def parse_feed_datetime(value, tz):
+    """Parse RSS pubDate into the configured local timezone."""
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = tz.localize(parsed)
+        return parsed.astimezone(tz)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def fetch_news_from_rss(target_date, tz):
     response = requests.get(RSS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
     response.raise_for_status()
     root = ET.fromstring(response.content)
@@ -139,8 +154,19 @@ def fetch_news_from_rss():
         title = item.findtext("title", default="").strip()
         link = item.findtext("link", default="").strip()
         description = item.findtext("description", default="").strip()
+        published_raw = item.findtext("pubDate", default="").strip()
+        published_at = parse_feed_datetime(published_raw, tz)
+
+        # Never put yesterday's or an undated story into today's tab.
+        if not published_at or published_at.date() != target_date:
+            continue
         if title and link and link.startswith("http"):
-            articles.append({"title": title, "link": link, "description": description})
+            articles.append({
+                "title": title,
+                "link": link,
+                "description": description,
+                "published_at": published_at,
+            })
     return articles
 
 
@@ -168,9 +194,9 @@ PROMPT = """
 सबसे महत्वपूर्ण नियम:
 1. केवल तब is_relevant=true दें जब खबर में किसी स्थानीय जनता की वास्तविक समस्या और उसके समाधान के लिए सरकार/जिला प्रशासन/PWD/पुलिस/स्वास्थ्य/शिक्षा/बिजली/जल/नगर निकाय/अन्य सार्वजनिक प्राधिकरण की ठोस कार्रवाई आवश्यक हो। दुर्घटना या अपराध की सामान्य खबर, राजनीतिक बयान, समारोह, खेल, मौसम का सामान्य पूर्वानुमान और बिना किसी स्पष्ट प्रशासनिक समस्या वाली खबर false होगी।
 2. खबर अगर पूरे राज्य, कई जिलों या कई अलग-अलग विधानसभा क्षेत्रों की हो और लेख किसी एक विधानसभा को स्पष्ट रूप से केंद्रित न करता हो, तो is_relevant=false करें। कभी भी “उत्तराखंड”, “राज्य स्तर”, “देहरादून जिला”, “मुख्यमंत्री की विधानसभा” या कोई अनुमानित विधानसभा न भरें।
-3. Vidhansabha_key केवल नीचे दिए गए 70 canonical keys में से एक हो सकता है। लेख में स्पष्ट स्थान/गांव/तहसील/नगर/मार्ग जिस विधानसभा में आता है, वही key चुनें। यदि mapping निश्चित नहीं है तो false करें।
+3. Vidhansabha_key केवल नीचे दिए गए 70 canonical keys में से एक हो सकता है। लेख में स्पष्ट स्थान/गांव/तहसील/नगर/मार्ग जिस विधानसभा में आता है, वही key चुनें। यदि mapping निश्चित नहीं है तो false करें। Sheet के Vidhansabha cell में बाद में केवल विधानसभा का साफ हिंदी नाम आएगा; संख्या, जिला, “(State Level)” या कोई अतिरिक्त text नहीं आएगा।
 4. Vidhansabha और Vidhayak model से invent नहीं करने हैं; code बाद में verified mapping लगाएगा। JSON में Vidhansabha_key ही दें।
-5. Location में लेख का सबसे सटीक स्थान लिखें—गांव, बाजार, चौक, मार्ग, पुल, अस्पताल, तहसील और जिला। केवल “उत्तराखंड”, “देहरादून जिला” या “स्थानीय क्षेत्र” पर्याप्त नहीं है।
+5. Location में केवल खबर में स्पष्ट रूप से दिया गया सबसे सटीक स्थानीय स्थान लिखें। पहले छोटे landmark/गांव/बाजार/चौक/पुल/सड़क/अस्पताल का नाम दें और जरूरत हो तो उसके बाद क्षेत्र/तहसील लिखें। उदाहरण: “जखंड गांव, अमोली, नाबड़ी, ततिया और मंडल क्षेत्र”, “लाइब्रेरी चौक, माल रोड, मसूरी” या “काठगोदाम मार्ग, चोपड़ा, नैनीताल, दो गांव के पास”। केवल जिला, राज्य, “देहरादून जिला”, “उत्तरकाशी” या “स्थानीय क्षेत्र” न लिखें। एक ही स्थान को दोहराएँ नहीं, अनावश्यक प्रशासनिक विवरण न जोड़ें, और article में न लिखा हुआ landmark अनुमान से न बनाएं।
 6. Issue summary नहीं होगा। शुद्ध और स्वाभाविक हिंदी के पूरे विवरण में लिखें: क्या हुआ, जनता को किस तरह की परेशानी/जोखिम है, लोगों की मांग क्या है, और प्रशासन/विभाग ने क्या किया या क्या stand बताया है। यदि मांग या प्रशासनिक stand लेख में नहीं है तो साफ लिखें “खबर में मांग/प्रशासनिक पक्ष स्पष्ट नहीं बताया गया है”; उसे गढ़ें नहीं।
 7. Issue, Location और POC हिंदी में लिखें। केवल unavoidable proper noun, संक्षिप्त सरकारी नाम, संख्या और URL में English स्वीकार्य है। अंग्रेजी वाक्य, Hinglish या English summary बिल्कुल न लिखें।
 8. POC में source newspaper और article byline/reporter हो तो दोनों लिखें, जैसे “अमर उजाला / रेणु सकलानी”।
@@ -183,7 +209,7 @@ JSON schema exactly:
 {{
   "is_relevant": true,
   "Vidhansabha_key": "canonical_key",
-  "Location": "पूरी तरह स्पष्ट हिंदी स्थान",
+  "Location": "सबसे सटीक स्थानीय landmark/गांव/मार्ग, केवल article के प्रमाण के आधार पर",
   "Issue": "क्या हुआ, जनता की परेशानी, मांग और प्रशासनिक पक्ष सहित विस्तृत हिंदी विवरण",
   "POC": "अमर उजाला / reporter",
   "Date": "31 अगस्त, 2026"
@@ -253,7 +279,7 @@ def extract_structured_data(news_item, today_date_str):
         return None
 
     number, hindi_name, verified_mla = CONSTITUENCY[key]
-    data["Vidhansabha"] = format_constituency(key)
+    data["Vidhansabha"] = format_constituency(key)  # name only; no number or district
     data["Vidhayak"] = verified_mla
     data["Location"] = location
     data["Issue"] = issue
@@ -327,11 +353,22 @@ if __name__ == "__main__":
     print(f"Starting processing for {today_tab_name}")
 
     relevant_entries = []
-    for item in fetch_news_from_rss():
+    target_date = now.date()
+    same_day_items = fetch_news_from_rss(target_date, tz)
+    print(f"Found {len(same_day_items)} RSS articles published on {today_date_str}")
+
+    for item in same_day_items:
         parsed = extract_structured_data(item, today_date_str)
         if parsed:
             relevant_entries.append(parsed)
+            if len(relevant_entries) >= TARGET_NEWS:
+                break
         time.sleep(1)
 
+    if len(relevant_entries) < TARGET_NEWS:
+        print(
+            f"WARNING: only {len(relevant_entries)} valid same-day actionable articles found; "
+            f"no previous-day article will be used to reach {TARGET_NEWS}."
+        )
     append_to_sheet(relevant_entries, today_tab_name)
     print("Task completed successfully.")
