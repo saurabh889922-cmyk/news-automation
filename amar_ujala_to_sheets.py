@@ -76,7 +76,7 @@ def extract_structured_data(news_item, today_date_str):
             messages=[
                 {"role": "user", "content": prompt}
             ],
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             response_format={"type": "json_object"}
         )
         data = json.loads(response.choices[0].message.content)
