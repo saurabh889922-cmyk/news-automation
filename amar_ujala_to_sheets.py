@@ -38,7 +38,7 @@ def fetch_news_from_rss():
     return articles[:20]
 
 def extract_structured_data(news_item, today_date_str):
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-pro')
     
     prompt = f"""
     Aapko Uttarakhand News parse karni hai aur Ground Impact Assessment Sheet ke exact format me extract karna hai.
