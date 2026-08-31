@@ -35,7 +35,7 @@ def fetch_news_from_rss():
                     "link": link,
                     "description": description
                 })
-    return articles[:20]
+    return articles[:5]
 
 def extract_structured_data(news_item, today_date_str):
     model = genai.GenerativeModel('gemini-3.6-flash')
