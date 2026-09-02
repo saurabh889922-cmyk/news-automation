@@ -4,9 +4,9 @@ import time
 import re
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from bs4 import BeautifulSoup
 from groq import Groq
@@ -21,10 +21,12 @@ SPREADSHEET_ID = os.environ.get(
 )
 CREDENTIALS_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "service-account.json")
 RSS_URL = os.environ.get("RSS_URL", "https://www.amarujala.com/rss/uttarakhand.xml")
+PORTAL_URLS = [u.strip() for u in os.environ.get("PORTAL_URLS", "https://www.amarujala.com/uttarakhand").split(",") if u.strip()]
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Kolkata")
 MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "100"))
 TARGET_NEWS = int(os.environ.get("TARGET_NEWS", "10"))
 MAX_ARTICLE_CHARS = int(os.environ.get("MAX_ARTICLE_CHARS", "18000"))
+LOOKBACK_HOURS = float(os.environ.get("LOOKBACK_HOURS", "30"))
 
 if not GROQ_API_KEY:
     raise RuntimeError("GROQ_API_KEY environment variable is missing")
@@ -54,7 +56,7 @@ CONSTITUENCY = {
     "sahaspur": (17, "सहसपुर", "सहदेव सिंह पुंडीर (BJP)"),
     "dharampur": (18, "धर्मपुर", "विनोद चमोली (BJP)"),
     "raipur": (19, "रायपुर", "उमेश शर्मा काऊ (BJP)"),
-    "rajpur_road": (20, "राजपुर रोड", "खजान दास (BJP)"),
+    "rajpur_road": (20, "राजपुर रोड(SC)", "खजान दास (BJP)"),
     "dehradun_cantt": (21, "देहरादून कैंट", "सविता कपूर (BJP)"),
     "mussoorie": (22, "मसूरी", "गणेश जोशी (BJP)"),
     "doiwala": (23, "डोईवाला", "बृज भूषण गैरोला (BJP)"),
@@ -150,6 +152,7 @@ def fetch_news_from_rss(target_date, tz):
     response.raise_for_status()
     root = ET.fromstring(response.content)
     articles = []
+    cutoff = datetime.now(tz) - timedelta(hours=LOOKBACK_HOURS)
     for item in root.findall("./channel/item")[:MAX_ARTICLES]:
         title = item.findtext("title", default="").strip()
         link = item.findtext("link", default="").strip()
@@ -157,8 +160,9 @@ def fetch_news_from_rss(target_date, tz):
         published_raw = item.findtext("pubDate", default="").strip()
         published_at = parse_feed_datetime(published_raw, tz)
 
-        # Never put yesterday's or an undated story into today's tab.
-        if not published_at or published_at.date() != target_date:
+        # Keep recent stories within the configured window. The old exact-date
+        # check could exclude valid stories published shortly before the run.
+        if not published_at or published_at < cutoff:
             continue
         if title and link and link.startswith("http"):
             articles.append({
@@ -168,6 +172,56 @@ def fetch_news_from_rss(target_date, tz):
                 "published_at": published_at,
             })
     return articles
+
+
+def fetch_news_from_portal(tz):
+    """Collect Uttarakhand article links visible on the configured portal pages."""
+    articles = []
+    seen = set()
+    for page_url in PORTAL_URLS:
+        try:
+            response = requests.get(
+                page_url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "hi-IN,hi;q=0.9"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            for anchor in soup.select("a[href]"):
+                href = urljoin(page_url, anchor.get("href", "").strip())
+                parsed = urlparse(href)
+                title = anchor.get_text(" ", strip=True)
+                if (
+                    parsed.scheme not in {"http", "https"}
+                    or "amarujala.com" not in parsed.netloc
+                    or "/uttarakhand/" not in parsed.path
+                    or not title
+                    or len(title) < 20
+                    or href in seen
+                ):
+                    continue
+                seen.add(href)
+                articles.append({
+                    "title": title,
+                    "link": href,
+                    "description": "",
+                    "published_at": datetime.now(tz),
+                })
+        except requests.RequestException as exc:
+            print(f"Portal scan failed for {page_url}: {exc}")
+    return articles
+
+
+def merge_articles(*article_lists):
+    merged = []
+    seen = set()
+    for article_list in article_lists:
+        for article in article_list:
+            link = article.get("link", "").strip()
+            if link and link not in seen:
+                seen.add(link)
+                merged.append(article)
+    return merged
 
 
 def fetch_article_text(url):
@@ -202,3 +256,165 @@ PROMPT = """
 """
 
 
+
+
+# Expected JSON returned by Groq. Keep the output contract explicit.
+PROMPT += """
+
+केवल इस JSON object में उत्तर दें:
+{
+  "is_relevant": true,
+  "Vidhansabha_key": "canonical_key_or_empty",
+  "Location": "हिंदी में सटीक स्थान",
+  "Issue": "हिंदी में पूरा विवरण",
+  "POC": "हिंदी में संबंधित विभाग/अधिकारी/व्यक्ति, या स्पष्ट रूप से उपलब्ध नहीं",
+  "confidence": 0.0
+}
+यदि खबर relevant नहीं है तो is_relevant=false और बाकी fields खाली string रखें। Markdown या अतिरिक्त text बिल्कुल न दें।
+"""
+
+SHEET_NAME = os.environ.get("SHEET_NAME", "Sheet1")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+SHEET_HEADERS = ["Vidhansabha", "Vidhayak", "Location", "Issue", "Link"]
+
+
+def get_worksheet(tab_name):
+    if not os.path.exists(CREDENTIALS_FILE):
+        raise FileNotFoundError(f"Google credentials file not found: {CREDENTIALS_FILE}")
+
+    scopes = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
+    credentials = ServiceAccountCredentials.from_json_keyfile_name(
+        CREDENTIALS_FILE, scopes
+    )
+    sheets = gspread.authorize(credentials)
+    spreadsheet = sheets.open_by_key(SPREADSHEET_ID)
+
+    try:
+        worksheet = spreadsheet.worksheet(tab_name)
+        print(f"Using existing date tab: {tab_name}")
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=tab_name, rows=1000, cols=len(SHEET_HEADERS))
+        print(f"Created new date tab: {tab_name}")
+
+    current_headers = worksheet.row_values(1)
+    if current_headers[: len(SHEET_HEADERS)] != SHEET_HEADERS:
+        worksheet.update("A1:E1", [SHEET_HEADERS])
+        print(f"Initialized headers in worksheet: {tab_name}")
+    return worksheet
+
+
+def analyze_article(article, article_text):
+    prompt = (
+        PROMPT
+        + "\n\nशीर्षक:\n"
+        + article["title"]
+        + "\n\nRSS विवरण:\n"
+        + article["description"]
+        + "\n\nपूरा लेख:\n"
+        + article_text
+    )
+    completion = client_groq.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        response_format={"type": "json_object"},
+    )
+    content = completion.choices[0].message.content or "{}"
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        raise ValueError("Groq response is not a JSON object")
+    return result
+
+
+def build_row(article, result, local_date):
+    key = normalize_constituency(result.get("Vidhansabha_key", ""))
+    if not result.get("is_relevant") or key not in CONSTITUENCY:
+        return None
+
+    _, hindi_constituency, vidhayak = CONSTITUENCY[key]
+    return [
+        hindi_constituency,
+        vidhayak,
+        str(result.get("Location", "")).strip(),
+        str(result.get("Issue", "")).strip(),
+        article["link"],
+    ]
+
+
+def append_new_rows(worksheet, rows):
+    if not rows:
+        print("No relevant articles found; no rows were written.")
+        return 0
+
+    existing_links = set()
+    link_column = worksheet.col_values(5)[1:]
+    existing_links.update(link.strip() for link in link_column if link.strip())
+    new_rows = [row for row in rows if row[4] not in existing_links]
+
+    if new_rows:
+        worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
+        print(f"Successfully appended {len(new_rows)} row(s) to {SHEET_NAME}.")
+    else:
+        print("All relevant articles already exist in the sheet.")
+    return len(new_rows)
+
+
+def main():
+    tz = pytz.timezone(TIMEZONE)
+    local_date = datetime.now(tz).date()
+    print(f"Starting automation for {local_date} ({TIMEZONE})")
+
+    rss_articles = fetch_news_from_rss(local_date, tz)
+    portal_articles = fetch_news_from_portal(tz)
+    articles = merge_articles(rss_articles, portal_articles)
+    print(f"RSS articles: {len(rss_articles)}; portal links: {len(portal_articles)}; unique total: {len(articles)}")
+    tab_name = local_date.isoformat()
+    worksheet = get_worksheet(tab_name)
+    rows = []
+
+    for index, article in enumerate(articles[:MAX_ARTICLES], start=1):
+        try:
+            article_text = fetch_article_text(article["link"])
+            if not article_text:
+                print(f"[{index}] Skipped: empty article text")
+                continue
+            result = analyze_article(article, article_text)
+            row = build_row(article, result, local_date)
+            if row:
+                rows.append(row)
+                print(f"[{index}] Relevant: {article['title'][:90]}")
+            else:
+                print(f"[{index}] Not relevant or constituency not verified")
+        except Exception as exc:
+            print(f"[{index}] Failed: {article['link']} -> {exc}")
+
+    written = append_new_rows(worksheet, rows)
+    print(f"Done. Candidate rows: {len(rows)}; newly written rows: {written}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+def _test_row_shape():
+    """Small local sanity check; it does not contact Google or Groq."""
+    sample = {"is_relevant": True, "Vidhansabha_key": "mussoorie", "Location": "माल रोड", "Issue": "सड़क की समस्या", "POC": "नगर निकाय"}
+    row = build_row({"link": "https://example.com"}, sample, date(2026, 1, 1))
+    assert row[0] == "मसूरी" and row[4] == "https://example.com" and len(row) == 5
+
+
+_test_row_shape()
+
+def _check_runtime_config():
+    print(f"Configured sheet: {SHEET_NAME}; model: {GROQ_MODEL}")
+
+
+_check_runtime_config()
+
+
+# Note: the test/config checks above run during startup, while main() is invoked
+# only when this file is executed directly by GitHub Actions.
